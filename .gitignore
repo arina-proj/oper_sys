@@ -1,0 +1,10 @@
+*.bin
+*.so
+secure_copy
+encrypted*
+decrypted*
+test_*
+*.png
+*.jpg
+*.jpeg
+
