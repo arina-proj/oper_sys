@@ -6,7 +6,7 @@ void set_key(char key){
     cipher_key = key;
 }
 
-void cipher(void* src, void* dst, int len){
+void caesar(void* src, void* dst, int len){
 
     char* source = (char*)src;
     char* target = (char*)dst;
