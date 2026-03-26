@@ -5,227 +5,240 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <errno.h>
+
 #define BUFFER_SIZE 4096
 
+// Глобальные переменные
 volatile sig_atomic_t keep_running = 1;
 
-struct shared_buffer {
-    char data[BUFFER_SIZE];
-    int size;
-    int producer_done;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond_producer;
-    pthread_cond_t cond_consumer;
-};
+// Мьютексы
+pthread_mutex_t file_list_mutex;
+pthread_mutex_t counter_mutex;
+pthread_mutex_t log_mutex;
 
-struct producer_args {
-    struct shared_buffer* buf;
-    FILE* input_file;
-    long file_size;
-    long* processed; 
-    void(*set_key)(char);
-    void(*cipher)(void*, void*, int);
-    char key;
-};
+// Общие данные
+char** file_list;
+int total_files;
+int next_file_index;
+int completed_files;
+char* output_directory;
+int encryption_key;
 
-struct consumer_args {
-    struct shared_buffer* buf;
-    FILE* output_file;
-};
+// Функции из библиотеки
+void (*set_key)(char);
+void (*caesar)(void*, void*, int);
 
+// Обработчик сигнала
 void signal_handler(int sig) {
     keep_running = 0;
 }
 
-void update_progress(long current, long total) {
-    if (total==0) return;
-    int percent = current*100/total;
-    printf("\r[");
-    for (int i=0; i<50;i++){
-        if(i<percent/2){
-            printf("=");
-        }
-        else{
-            printf(" ");
-        }
+// Логирование
+void write_log(const char* filename, const char* status, long thread_id) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 5;
+    
+    if (pthread_mutex_timedlock(&log_mutex, &ts) != 0) {
+        printf("\n⚠️ Таймаут логирования!\n");
+        return;
     }
-    printf("] %d%%", percent);
-    fflush(stdout);
+    
+    FILE* log = fopen("log.txt", "a");
+    if (log) {
+        time_t now = time(NULL);
+        char* time_str = ctime(&now);
+        time_str[strlen(time_str) - 1] = '\0';
+        fprintf(log, "[%s] Поток %ld: %s - %s\n", time_str, thread_id, filename, status);
+        fclose(log);
+    }
+    
+    pthread_mutex_unlock(&log_mutex);
 }
 
-void* producer_thread(void* arg) {
-    struct producer_args* args = (struct producer_args*)arg;
-    struct shared_buffer* buf = args->buf;
-    FILE* input = args->input_file;
-    long total = args->file_size;
-    long* processed = args->processed;
-    void (*set_key)(char) = args->set_key;
-    void (*cipher)(void*,void*,int) = args->cipher;
-    char key = args->key;
-    set_key(key);
+// Получить следующий файл
+char* get_next_file(long thread_id) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 5;
+    
+    if (pthread_mutex_timedlock(&file_list_mutex, &ts) != 0) {
+        write_log("WARNING: Deadlock", "TIMEOUT", thread_id);
+        return NULL;
+    }
+    
+    char* filename = NULL;
+    if (next_file_index < total_files && keep_running) {
+        filename = file_list[next_file_index];
+        next_file_index++;
+        write_log(filename, "STARTED", thread_id);
+    }
+    
+    pthread_mutex_unlock(&file_list_mutex);
+    return filename;
+}
 
-    char temp_buf[BUFFER_SIZE];
+// Увеличить счетчик
+void increment_counter(long thread_id) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 5;
+    
+    if (pthread_mutex_timedlock(&counter_mutex, &ts) == 0) {
+        completed_files++;
+        printf("\r📊 Прогресс: %d/%d файлов", completed_files, total_files);
+        fflush(stdout);
+        pthread_mutex_unlock(&counter_mutex);
+    }
+}
+
+// Шифрование одного файла
+int encrypt_single_file(const char* input_path, const char* output_path, int key, long thread_id) {
+    // Открыть входной файл
+    FILE* input = fopen(input_path, "rb");
+    if (!input) {
+        write_log(input_path, "ERROR: cannot open input", thread_id);
+        return -1;
+    }
+    
+    // Открыть выходной файл
+    FILE* output = fopen(output_path, "wb");
+    if (!output) {
+        write_log(input_path, "ERROR: cannot open output", thread_id);
+        fclose(input);
+        return -1;
+    }
+    
+    // Установить ключ
+    set_key(key);
+    
+    // Буферы
+    char buffer[BUFFER_SIZE];
     size_t bytes_read;
     
-    while (!feof(input) && keep_running) {
-        pthread_mutex_lock(&buf->mutex);
-        while (buf->size > 0 && keep_running) {
-            pthread_cond_wait(&buf->cond_producer, &buf->mutex);
-        }
-        if (!keep_running) {
-            pthread_mutex_unlock(&buf->mutex);
-            break;
-        }
-        bytes_read = fread(temp_buf, 1, BUFFER_SIZE, input);
-        if (bytes_read == 0) {
-            buf->producer_done = 1;
-            pthread_mutex_unlock(&buf->mutex);
-            break;
-        }
-        cipher(temp_buf, temp_buf, bytes_read);
-        memcpy(buf->data, temp_buf, bytes_read);
-        buf->size = bytes_read;
-        *processed += bytes_read;
-        update_progress(*processed, total);
-        pthread_cond_signal(&buf->cond_consumer);
-        pthread_mutex_unlock(&buf->mutex);
+    // Читаем, шифруем, пишем
+    while (keep_running && (bytes_read = fread(buffer, 1, BUFFER_SIZE, input)) > 0) {
+        caesar(buffer, buffer, bytes_read);
+        fwrite(buffer, 1, bytes_read, output);
     }
-    pthread_mutex_lock(&buf->mutex);
-    buf->producer_done = 1;
-    pthread_cond_signal(&buf->cond_consumer);
-    pthread_mutex_unlock(&buf->mutex);
-    return NULL;
-
+    
+    fclose(input);
+    fclose(output);
+    
+    return 0;
 }
 
-void* consumer_thread(void* arg) {
-    struct consumer_args* args = (struct consumer_args*)arg;
-    struct shared_buffer* buf = args->buf;
-    FILE* output = args->output_file;
-    char temp_buf[BUFFER_SIZE];
-    int bytes_to_write;
-    while (keep_running){
-        pthread_mutex_lock(&buf->mutex);
-        while (buf->size == 0 && !buf->producer_done && keep_running) {
-            pthread_cond_wait(&buf->cond_consumer, &buf->mutex);
-        }
+// Поток-воркер
+void* worker_thread(void* arg) {
+    long thread_id = (long)arg;
     
-        if (!keep_running || (buf->producer_done && buf->size == 0)) {
-            pthread_mutex_unlock(&buf->mutex);
-            break;
+    while (keep_running) {
+        // 1. Взять следующий файл
+        char* filename = get_next_file(thread_id);
+        if (!filename) break;
+        
+        // 2. Сформировать пути
+        char input_path[512];
+        char output_path[512];
+        snprintf(input_path, sizeof(input_path), "%s", filename);
+        snprintf(output_path, sizeof(output_path), "%s/%s", output_directory, filename);
+        
+        // 3. Замерить время
+        clock_t start = clock();
+        
+        // 4. Шифровать файл
+        int result = encrypt_single_file(input_path, output_path, encryption_key, thread_id);
+        
+        // 5. Записать в лог
+        clock_t end = clock();
+        double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
+        
+        if (result == 0) {
+            write_log(filename, "OK", thread_id);
+            increment_counter(thread_id);
+        } else {
+            write_log(filename, "FAILED", thread_id);
         }
-        
-        bytes_to_write = buf->size;
-        memcpy(temp_buf, buf->data, bytes_to_write);
-        
-        buf->size = 0;
-        
-        pthread_cond_signal(&buf->cond_producer);
-        
-        pthread_mutex_unlock(&buf->mutex);
-        
-        fwrite(temp_buf, 1, bytes_to_write, output);
     }
-
+    
     return NULL;
 }
 
 int main(int argc, char* argv[]) {
-
-    if (argc != 4) {
-        fprintf(stderr, "Использование: %s <входной_файл> <выходной_файл> <ключ>\n", argv[0]);
+    // 1. Проверить аргументы (минимум 3 файла + папка + ключ)
+    if (argc < 4) {
+        fprintf(stderr, "Использование: %s файл1 файл2 ... файлN выходная_папка ключ\n", argv[0]);
+        fprintf(stderr, "Пример: %s f1.txt f2.txt f3.txt outdir/ 42\n", argv[0]);
         return 1;
     }
     
-
-    char* input_filename = argv[1];
-    char* output_filename = argv[2];
-    int key = atoi(argv[3]);  // превращаем строку в число
+    // 2. Парсим аргументы
+    encryption_key = atoi(argv[argc - 1]);      // последний - ключ
+    output_directory = argv[argc - 2];           // предпоследний - папка
+    total_files = argc - 3;                      // остальные - файлы
+    file_list = &argv[1];                        // указатель на первый файл
     
-
-    FILE* input_file = fopen(input_filename, "rb");
-    if (!input_file) {
-        perror("Ошибка открытия входного файла");
-        return 1;
-    }
+    printf("📁 Файлов для обработки: %d\n", total_files);
+    printf("🔑 Ключ шифрования: %d\n", encryption_key);
+    printf("📂 Выходная папка: %s\n", output_directory);
     
-
-    FILE* output_file = fopen(output_filename, "wb");
-    if (!output_file) {
-        perror("Ошибка открытия выходного файла");
-        fclose(input_file);
-        return 1;
-    }
+    // 3. Создать выходную директорию
+    mkdir(output_directory, 0755);
     
-
-    fseek(input_file, 0, SEEK_END);
-    long file_size = ftell(input_file);
-    fseek(input_file, 0, SEEK_SET);
+    // 4. Инициализировать мьютексы
+    pthread_mutex_init(&file_list_mutex, NULL);
+    pthread_mutex_init(&counter_mutex, NULL);
+    pthread_mutex_init(&log_mutex, NULL);
     
-
+    // 5. Инициализировать глобальные переменные
+    next_file_index = 0;
+    completed_files = 0;
+    
+    // 6. Загрузить библиотеку
     void* lib_handle = dlopen("./libcaesar.so", RTLD_LAZY);
     if (!lib_handle) {
         fprintf(stderr, "Ошибка загрузки библиотеки: %s\n", dlerror());
-        fclose(input_file);
-        fclose(output_file);
         return 1;
     }
     
-
-    void (*set_key)(char) = dlsym(lib_handle, "set_key");
-    void (*caesar)(void*, void*, int) = dlsym(lib_handle, "caesar");
+    // 7. Получить функции
+    set_key = dlsym(lib_handle, "set_key");
+    caesar = dlsym(lib_handle, "caesar");
     
     if (!set_key || !caesar) {
         fprintf(stderr, "Ошибка получения функций: %s\n", dlerror());
         dlclose(lib_handle);
-        fclose(input_file);
-        fclose(output_file);
         return 1;
     }
     
-
-    struct shared_buffer buffer;
-    buffer.size = 0;
-    buffer.producer_done = 0;
-    pthread_mutex_init(&buffer.mutex, NULL);
-    pthread_cond_init(&buffer.cond_producer, NULL);
-    pthread_cond_init(&buffer.cond_consumer, NULL);
-    
-    long processed_bytes = 0;
-    
-    struct producer_args p_args;
-    p_args.buf = &buffer;
-    p_args.input_file = input_file;
-    p_args.file_size = file_size;
-    p_args.processed = &processed_bytes;
-    p_args.set_key = set_key;
-    p_args.cipher = caesar;
-    p_args.key = key;
-    
-    struct consumer_args c_args;
-    c_args.buf = &buffer;
-    c_args.output_file = output_file;
-    
-
+    // 8. Установить обработчик сигнала
     signal(SIGINT, signal_handler);
     
-
-    pthread_t producer, consumer;
-    pthread_create(&producer, NULL, producer_thread, &p_args);
-    pthread_create(&consumer, NULL, consumer_thread, &c_args);
+    // 9. Создать 3 потока
+    pthread_t threads[3];
+    for (int i = 0; i < 3; i++) {
+        pthread_create(&threads[i], NULL, worker_thread, (void*)(long)i);
+    }
     
-
-    pthread_join(producer, NULL);
-    pthread_join(consumer, NULL);
+    // 10. Ждать завершения
+    for (int i = 0; i < 3; i++) {
+        pthread_join(threads[i], NULL);
+    }
     
-
-    fclose(input_file);
-    fclose(output_file);
+    // 11. Вывести итог
+    printf("\n\n✅ Готово! Скопировано %d из %d файлов\n", completed_files, total_files);
+    printf("📝 Лог записан в log.txt\n");
     
-
+    // 12. Очистить мьютексы
+    pthread_mutex_destroy(&file_list_mutex);
+    pthread_mutex_destroy(&counter_mutex);
+    pthread_mutex_destroy(&log_mutex);
+    
+    // 13. Выгрузить библиотеку
     dlclose(lib_handle);
     
-
-    printf("\nКопирование завершено!\n");
     return 0;
 }

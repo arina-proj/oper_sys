@@ -23,7 +23,7 @@ test: $(TARGET) input.txt
 SECURE_COPY = secure_copy
 
 secure_copy: secure_copy.c
-	gcc -pthread -Wall -o $(SECURE_COPY) secure_copy.c -ldl
+	gcc -pthread -Wall -o secure_copy secure_copy.c -ldl -lrt
 
 test_secure: secure_copy
 	@echo "🔐 Тестирование secure_copy..."
