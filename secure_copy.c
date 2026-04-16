@@ -11,8 +11,23 @@
 
 #define BUFFER_SIZE 4096
 
+#define WORKERS_COUNT 4  // максимум потоков в параллельном режиме
+
+// Режимы работы
+#define MODE_SEQUENTIAL 0
+#define MODE_PARALLEL 1
+#define MODE_AUTO 2
+
+
+
 // Глобальные переменные
 volatile sig_atomic_t keep_running = 1;
+
+struct statistics {
+    double total_time;      // общее время выполнения
+    double avg_time;        // среднее время на файл
+    int files_processed;    // количество обработанных файлов
+};
 
 // Мьютексы
 pthread_mutex_t file_list_mutex;
@@ -167,6 +182,87 @@ void* worker_thread(void* arg) {
     return NULL;
 }
 
+// Замер времени выполнения (в секундах с микросекундами)
+double get_time() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1000000000.0;
+}
+
+// Функция для последовательной обработки
+struct statistics run_sequential(char** files, int count, char* out_dir, int key) {
+    struct statistics stats;
+    stats.files_processed = 0;
+    
+    double start_time = get_time();
+    
+    for (int i = 0; i < count && keep_running; i++) {
+        char output_path[512];
+        snprintf(output_path, sizeof(output_path), "%s/%s", out_dir, files[i]);
+        
+        double file_start = get_time();
+        int result = encrypt_single_file(files[i], output_path, key, 0);
+        double file_end = get_time();
+        
+        if (result == 0) {
+            stats.files_processed++;
+            completed_files++;
+            printf("[%d/%d] %s - %.3f сек\n", 
+                   i+1, count, files[i], file_end - file_start);
+        } else {
+            printf("[%d/%d] %s - ОШИБКА\n", i+1, count, files[i]);
+        }
+    }
+    
+    double end_time = get_time();
+    stats.total_time = end_time - start_time;
+    stats.avg_time = (stats.files_processed > 0) ? 
+                     stats.total_time / stats.files_processed : 0;
+    
+    return stats;
+}
+
+struct statistics run_parallel(char** files, int count, char* out_dir, int key) {
+    // Сохраняем глобальные настройки
+    total_files = count;
+    file_list = files;
+    output_directory = out_dir;
+    encryption_key = key;
+    next_file_index = 0;
+    completed_files = 0;
+    
+    double start_time = get_time();
+    
+    // Создаем WORKERS_COUNT потоков
+    pthread_t threads[WORKERS_COUNT];
+    for (int i = 0; i < WORKERS_COUNT; i++) {
+        pthread_create(&threads[i], NULL, worker_thread, (void*)(long)i);
+    }
+    
+    // Ждем завершения
+    for (int i = 0; i < WORKERS_COUNT; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    double end_time = get_time();
+    
+    struct statistics stats;
+    stats.total_time = end_time - start_time;
+    stats.files_processed = completed_files;
+    stats.avg_time = (stats.files_processed > 0) ? 
+                     stats.total_time / stats.files_processed : 0;
+    
+    return stats;
+}
+
+void print_statistics(struct statistics stats, int mode_type, const char* mode_name) {
+    printf("\n📊 СТАТИСТИКА (%s режим):\n", mode_name);
+    printf("   ✅ Обработано файлов: %d\n", stats.files_processed);
+    printf("   ⏱️  Общее время: %.3f сек\n", stats.total_time);
+    printf("   📈 Среднее время на файл: %.3f сек\n", stats.avg_time);
+}
+
+
 int main(int argc, char* argv[]) {
     // 1. Проверить аргументы (минимум 3 файла + папка + ключ)
     if (argc < 4) {
@@ -217,20 +313,42 @@ int main(int argc, char* argv[]) {
     // 8. Установить обработчик сигнала
     signal(SIGINT, signal_handler);
     
-    // 9. Создать 3 потока
-    pthread_t threads[3];
-    for (int i = 0; i < 3; i++) {
-        pthread_create(&threads[i], NULL, worker_thread, (void*)(long)i);
+       // 9. Автовыбор режима
+    int actual_mode = MODE_PARALLEL;  // по умолчанию параллельный
+    
+    // Проверяем аргумент --mode= (если есть)
+    if (argc > 1 && strncmp(argv[1], "--mode=", 7) == 0) {
+        if (strcmp(argv[1] + 7, "sequential") == 0) actual_mode = MODE_SEQUENTIAL;
+        else if (strcmp(argv[1] + 7, "parallel") == 0) actual_mode = MODE_PARALLEL;
+        else if (strcmp(argv[1] + 7, "auto") == 0) {
+            actual_mode = (total_files < 5) ? MODE_SEQUENTIAL : MODE_PARALLEL;
+            printf("🔧 Автовыбор: %s режим\n", (actual_mode == MODE_SEQUENTIAL) ? "последовательный" : "параллельный");
+        }
+    } else {
+        // Без аргумента --mode= - автовыбор
+        actual_mode = (total_files < 5) ? MODE_SEQUENTIAL : MODE_PARALLEL;
+        printf("🔧 Автовыбор: %s режим\n", (actual_mode == MODE_SEQUENTIAL) ? "последовательный" : "параллельный");
     }
     
-    // 10. Ждать завершения
-    for (int i = 0; i < 3; i++) {
-        pthread_join(threads[i], NULL);
+        struct statistics stats;
+    
+    double start_time = get_time();
+    
+    if (actual_mode == MODE_SEQUENTIAL) {
+        stats = run_sequential(file_list, total_files, output_directory, encryption_key);
+    } else {
+        stats = run_parallel(file_list, total_files, output_directory, encryption_key);
     }
     
-    // 11. Вывести итог
+    double end_time = get_time();
+    
+    // 10. Вывести итог
     printf("\n\n✅ Готово! Скопировано %d из %d файлов\n", completed_files, total_files);
     printf("📝 Лог записан в log.txt\n");
+    printf("⏱️ Время выполнения: %.3f сек\n", end_time - start_time);
+    
+    // Выводим статистику
+    print_statistics(stats, actual_mode, (actual_mode == MODE_SEQUENTIAL) ? "последовательный" : "параллельный");
     
     // 12. Очистить мьютексы
     pthread_mutex_destroy(&file_list_mutex);
@@ -241,4 +359,6 @@ int main(int argc, char* argv[]) {
     dlclose(lib_handle);
     
     return 0;
+
+    
 }

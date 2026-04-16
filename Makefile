@@ -1,5 +1,5 @@
 CC = gcc #имя компилятора - такое по заданию 
-CFLAGS = -Wall -Wextra -pedantic -fPIC #флаги компилятора(настройки) - прописаны в задании
+CFLAGS = -Wall -Wextra -pedantic -fPIC -DWORKERS_COUNT=4
 TARGET = libcaesar.so # имя выходного файла
 TEST_PROG = test_cipher.py # имя тестового файла
 all: $(TARGET) # главная цель - target
@@ -23,7 +23,7 @@ test: $(TARGET) input.txt
 SECURE_COPY = secure_copy
 
 secure_copy: secure_copy.c
-	gcc -pthread -Wall -o secure_copy secure_copy.c -ldl -lrt
+	gcc -pthread -Wall -o secure_copy secure_copy.c -ldl -lrt -DWORKERS_COUNT=4 
 
 test_secure: secure_copy
 	@echo "🔐 Тестирование secure_copy..."
