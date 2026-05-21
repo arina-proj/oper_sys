@@ -8,6 +8,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <sys/mman.h>
 
 #define BUFFER_SIZE 4096
 
@@ -17,7 +18,7 @@
 #define MODE_SEQUENTIAL 0
 #define MODE_PARALLEL 1
 #define MODE_AUTO 2
-
+unsigned char* protected_key = NULL;
 
 
 // Глобальные переменные
@@ -40,7 +41,7 @@ int total_files;
 int next_file_index;
 int completed_files;
 char* output_directory;
-int encryption_key;
+
 
 // Функции из библиотеки
 void (*set_key)(char);
@@ -49,6 +50,46 @@ void (*caesar)(void*, void*, int);
 // Обработчик сигнала
 void signal_handler(int sig) {
     keep_running = 0;
+}
+
+// Обработчик ошибки доступа к памяти
+void segfault_handler(int sig) {
+    fprintf(stderr, "\n❌ Ошибка безопасности: попытка записи в защищенную память!\n");
+    exit(1);
+}
+
+// Инициализация защищенной памяти
+void init_protected_memory() {
+    protected_key = mmap(NULL, 16, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (protected_key == MAP_FAILED) {
+        perror("mmap failed");
+        exit(1);
+    }
+}
+
+// Установка ключа в защищенную память
+void set_protected_key(int key) {
+    mprotect(protected_key, 16, PROT_READ | PROT_WRITE);
+    memcpy(protected_key, &key, sizeof(int));
+    mprotect(protected_key, 16, PROT_READ);
+}
+
+// Получение ключа из защищенной памяти
+int get_protected_key() {
+    int key;
+    memcpy(&key, protected_key, sizeof(int));
+    return key;
+}
+
+// Затирание и освобождение памяти
+void destroy_protected_memory() {
+    if (protected_key != NULL) {
+        mprotect(protected_key, 16, PROT_READ | PROT_WRITE);
+        memset(protected_key, 0, 16);
+        munmap(protected_key, 16);
+        protected_key = NULL;
+    }
 }
 
 // Логирование
@@ -128,7 +169,9 @@ int encrypt_single_file(const char* input_path, const char* output_path, int key
     }
     
     // Установить ключ
-    set_key(key);
+    int current_key = get_protected_key();
+    set_key(current_key);
+
     
     // Буферы
     char buffer[BUFFER_SIZE];
@@ -165,7 +208,7 @@ void* worker_thread(void* arg) {
         clock_t start = clock();
         
         // 4. Шифровать файл
-        int result = encrypt_single_file(input_path, output_path, encryption_key, thread_id);
+        int result = encrypt_single_file(input_path, output_path, get_protected_key(), thread_id);
         
         // 5. Записать в лог
         clock_t end = clock();
@@ -190,7 +233,7 @@ double get_time() {
 }
 
 // Функция для последовательной обработки
-struct statistics run_sequential(char** files, int count, char* out_dir, int key) {
+struct statistics run_sequential(char** files, int count, char* out_dir) {
     struct statistics stats;
     stats.files_processed = 0;
     
@@ -201,7 +244,7 @@ struct statistics run_sequential(char** files, int count, char* out_dir, int key
         snprintf(output_path, sizeof(output_path), "%s/%s", out_dir, files[i]);
         
         double file_start = get_time();
-        int result = encrypt_single_file(files[i], output_path, key, 0);
+        int result = encrypt_single_file(files[i], output_path, get_protected_key(), 0);
         double file_end = get_time();
         
         if (result == 0) {
@@ -222,12 +265,12 @@ struct statistics run_sequential(char** files, int count, char* out_dir, int key
     return stats;
 }
 
-struct statistics run_parallel(char** files, int count, char* out_dir, int key) {
+struct statistics run_parallel(char** files, int count, char* out_dir) {
     // Сохраняем глобальные настройки
     total_files = count;
     file_list = files;
     output_directory = out_dir;
-    encryption_key = key;
+    
     next_file_index = 0;
     completed_files = 0;
     
@@ -272,13 +315,13 @@ int main(int argc, char* argv[]) {
     }
     
     // 2. Парсим аргументы
-    encryption_key = atoi(argv[argc - 1]);      // последний - ключ
+    int key_value = atoi(argv[argc - 1]);    // последний - ключ
     output_directory = argv[argc - 2];           // предпоследний - папка
     total_files = argc - 3;                      // остальные - файлы
     file_list = &argv[1];                        // указатель на первый файл
     
     printf("📁 Файлов для обработки: %d\n", total_files);
-    printf("🔑 Ключ шифрования: %d\n", encryption_key);
+    printf("🔑 Ключ шифрования: %d\n", key_value);
     printf("📂 Выходная папка: %s\n", output_directory);
     
     // 3. Создать выходную директорию
@@ -313,6 +356,17 @@ int main(int argc, char* argv[]) {
     // 8. Установить обработчик сигнала
     signal(SIGINT, signal_handler);
     
+     // Установить обработчик SIGSEGV
+    struct sigaction sa;
+    sa.sa_handler = segfault_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGSEGV, &sa, NULL);
+    
+    // Инициализация защищенной памяти
+    init_protected_memory();
+    set_protected_key(key_value);
+
        // 9. Автовыбор режима
     int actual_mode = MODE_PARALLEL;  // по умолчанию параллельный
     
@@ -335,9 +389,9 @@ int main(int argc, char* argv[]) {
     double start_time = get_time();
     
     if (actual_mode == MODE_SEQUENTIAL) {
-        stats = run_sequential(file_list, total_files, output_directory, encryption_key);
+    stats = run_sequential(file_list, total_files, output_directory);
     } else {
-        stats = run_parallel(file_list, total_files, output_directory, encryption_key);
+        stats = run_parallel(file_list, total_files, output_directory);
     }
     
     double end_time = get_time();
@@ -357,7 +411,7 @@ int main(int argc, char* argv[]) {
     
     // 13. Выгрузить библиотеку
     dlclose(lib_handle);
-    
+    destroy_protected_memory();
     return 0;
 
     
