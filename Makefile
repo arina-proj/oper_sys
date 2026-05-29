@@ -1,54 +1,56 @@
 CC = gcc #имя компилятора - такое по заданию 
-CFLAGS = -Wall -Wextra -pedantic -fPIC -DWORKERS_COUNT=4
-TARGET = libcaesar.so # имя выходного файла
-TEST_PROG = test_cipher.py # имя тестового файла
-all: $(TARGET) # главная цель - target
-$(TARGET): xor_cipher.c # -shared - динамическая
-	$(CC) $(CFLAGS) -shared -o $(TARGET) xor_cipher.c 
-install: # cp - копировать /.. - куда, ldconfig - обновление кеша библиотек
-	cp $(TARGET) /usr/local/lib
-	ldconfig
-	@echo "✅ Библиотека установлена в /usr/local/lib/"
-test: $(TARGET) input.txt
-	python3 $(TEST_PROG) ./$(TARGET) A input.txt output.txt
-	@echo "\n🔍 Исходный файл:"
-	@cat input.txt
-	@echo "\n🔐 Зашифрованный файл:"
-	@cat output.txt
-	
-	@echo "\n🔄 Расшифровка:"
-	python3 $(TEST_PROG) ./$(TARGET) A output.txt decrypted.txt
-	@cat decrypted.txt
-	@echo "\n✅ Тест завершен!"
-SECURE_COPY = secure_copy
+CFLAGS = -Wall -Wextra -pedantic -DWORKERS_COUNT=4 #Включить все основные предупреждения
+#-Wextra	Включить дополнительные предупреждения
+#-pedantic	Строгое соответствие стандарту C (не разрешает расширения)
+#-DWORKERS_COUNT=4	Определяет макрос WORKERS_COUNT = 4 (как #define WORKERS_COUNT 4)
+LDFLAGS = -pthread -lrt
 
-secure_copy: secure_copy.c
-	gcc -pthread -Wall -o secure_copy secure_copy.c -ldl -lrt -DWORKERS_COUNT=4 
+all: secure_copy # главная цель - target
+
+secure_copy: secure_copy.c cipher_lib.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o secure_copy secure_copy.c cipher_lib.c
 
 test_secure: secure_copy
-	@echo "🔐 Тестирование secure_copy..."
-	@echo "Test data for secure_copy" > test_input.txt
-	./secure_copy test_input.txt test_encrypted.txt 42
-	@echo "✅ Зашифровано"
-	./secure_copy test_encrypted.txt test_decrypted.txt 42
-	@echo "✅ Расшифровано"
-	@echo "Проверка:"
-	diff test_input.txt test_decrypted.txt && echo "✅ Файлы совпадают!" || echo "❌ Ошибка!"
+	@echo "🔐 Тестирование обратимости XOR шифрования..."
+	@echo "Test data" > test_input.txt
+	
+	# Шифруем
+	mkdir -p encrypted
+	./secure_copy test_input.txt encrypted/ 42
+	
+	# Расшифровываем (XOR с тем же ключом)
+	mkdir -p decrypted
+	./secure_copy encrypted/test_input.txt decrypted/ 42
+	
+	# Проверяем (правильный путь!)
+	@if diff -q test_input.txt decrypted/encrypted/test_input.txt > /dev/null 2>&1; then \
+		echo "✅ Успех: XOR шифрование обратимо!"; \
+	else \
+		echo "❌ Ошибка: расшифровка не совпадает"; \
+		exit 1; \
+	fi
+	
+	rm -rf test_input.txt encrypted decrypted
 
 testfile:
 	dd if=/dev/urandom of=test_1mb.bin bs=1M count=1
+# 	dd — утилита для копирования с преобразованием
+# 	if=/dev/urandom — источник (случайные числа)
+# 	of=test_1mb.bin — куда сохранить
+# 	bs=1M — размер блока (1 мегабайт)
+# 	count=1 — количество блоков (1)
 	@echo "✅ Создан файл test_1mb.bin (1 МБ)"
 
-test_interrupt: secure_copy testfile
-	@echo "Запусти программу и нажми Ctrl+C через пару секунд:"
-	./secure_copy test_1mb.bin test_enc.bin 42
 clean:
-	rm -f $(TARGET)                # библиотека
-	rm -f output.txt decrypted.txt  # файлы из test
-	rm -f secure_copy               # программа
-	rm -f test_input.txt test_encrypted.txt test_decrypted.txt  # тестовые файлы
-	rm -f test_1mb.bin test_enc.bin  # файлы 1 МБ
+	rm -f secure_copy              
+	rm -f output.txt decrypted.txt  
+	rm -f test_input.txt test_encrypted.txt test_decrypted.txt  
+	rm -f test_1mb.bin test_enc.bin  
+	rm -f log.txt
+	rm -rf outdir/
+	rm -f *.img
 	@echo "🧹 Всё очищено!"
-.PHONY: all install test clean secure_copy test_secure testfile test_interrupt
+
+.PHONY: all clean test_secure testfile 
 
 
